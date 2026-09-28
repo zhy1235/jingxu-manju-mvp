@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Check, Download, Film, ImagePlus, LoaderCircle, Play, RefreshCw, Scissors, ShieldCheck, Sparkles, Upload, WandSparkles, X } from "lucide-react";
+import { Check, Download, ExternalLink, Eye, EyeOff, Film, ImagePlus, KeyRound, LoaderCircle, Play, RefreshCw, Scissors, ShieldCheck, Sparkles, Upload, WandSparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -11,6 +11,9 @@ type Status = "idle" | "cutting" | "ready" | "rendering" | "done" | "error";
 type Motion = "push" | "float" | "slide";
 type SceneKey = "rain" | "sunset" | "neon" | "paper";
 type Scene = { key: SceneKey; name: string; note: string; colors: [string, string, string] };
+type Provider = "local" | "jimeng" | "kling" | "custom";
+type RemoteProvider = Exclude<Provider, "local">;
+type RemoteResult = { taskId?: string; status?: string; videoUrl?: string; error?: string };
 
 const SCENES: Scene[] = [
   { key: "rain", name: "雨夜站台", note: "冷色 · 悬疑", colors: ["#071523", "#244963", "#7f2035"] },
@@ -20,6 +23,22 @@ const SCENES: Scene[] = [
 ];
 const DEFAULT_PROMPT = "角色在雨夜站台缓慢回头，镜头向前推进，风吹动衣角。";
 const DEFAULT_SUBTITLE = "末班车即将进站，请不要回头。";
+const PROVIDERS: { id: Provider; name: string; note: string }[] = [
+  { id: "local", name: "本地合成", note: "免费" },
+  { id: "jimeng", name: "即梦", note: "Seedance" },
+  { id: "kling", name: "可灵", note: "Kling" },
+  { id: "custom", name: "其他 API", note: "自定义" },
+];
+const DEFAULT_MODELS: Record<RemoteProvider, string> = { jimeng: "doubao-seedance-2-5-260628", kling: "kling-2.5-turbo", custom: "" };
+
+function fileToDataUrl(file: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("图片编码失败，请换一张图片重试。"));
+    reader.readAsDataURL(file);
+  });
+}
 
 function loadImage(src: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
@@ -88,8 +107,13 @@ export default function Home() {
   const [sceneKey, setSceneKey] = useState<SceneKey>("rain"); const [motion, setMotion] = useState<Motion>("push"); const [duration, setDuration] = useState(4);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT); const [subtitle, setSubtitle] = useState(DEFAULT_SUBTITLE);
   const [status, setStatus] = useState<Status>("idle"); const [progress, setProgress] = useState(0); const [message, setMessage] = useState("上传一张角色图开始"); const [previewTime, setPreviewTime] = useState(0.28);
+  const [provider, setProvider] = useState<Provider>("local");
+  const [apiKeys, setApiKeys] = useState<Record<RemoteProvider, string>>({ jimeng: "", kling: "", custom: "" });
+  const [models, setModels] = useState<Record<RemoteProvider, string>>(DEFAULT_MODELS);
+  const [customEndpoint, setCustomEndpoint] = useState(""); const [customStatusEndpoint, setCustomStatusEndpoint] = useState(""); const [showApiKey, setShowApiKey] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null); const backgroundInput = useRef<HTMLInputElement>(null); const canvasRef = useRef<HTMLCanvasElement>(null);
   const scene = useMemo(() => SCENES.find((item) => item.key === sceneKey) ?? SCENES[0], [sceneKey]); const activeCharacterUrl = cutoutUrl || sourceUrl;
+  const providerInfo = PROVIDERS.find((item) => item.id === provider) ?? PROVIDERS[0]; const isRemote = provider !== "local";
 
   const paintPreview = useCallback(async () => {
     const canvas = canvasRef.current; const ctx = canvas?.getContext("2d"); if (!canvas || !ctx) return;
@@ -99,7 +123,11 @@ export default function Home() {
   useEffect(() => { void paintPreview(); }, [paintPreview]);
 
   function resetResult() {
-    if (videoUrl) URL.revokeObjectURL(videoUrl); setVideoUrl(""); setVideoBlob(null); setStatus(cutoutUrl ? "ready" : "idle"); setProgress(0);
+    if (videoUrl?.startsWith("blob:")) URL.revokeObjectURL(videoUrl); setVideoUrl(""); setVideoBlob(null); setStatus(cutoutUrl ? "ready" : "idle"); setProgress(0);
+  }
+  function selectProvider(next: Provider) {
+    resetResult(); setProvider(next); setShowApiKey(false);
+    setMessage(next === "local" ? "已选择本地合成，不消耗 API" : `已选择${PROVIDERS.find((item) => item.id === next)?.name}，填写密钥后生成`);
   }
   function chooseCharacter(file?: File) {
     if (!file || !file.type.startsWith("image/")) return;
@@ -118,8 +146,39 @@ export default function Home() {
     } catch (error) { setStatus("error"); setProgress(0); setMessage(`抠图失败：${error instanceof Error ? error.message : "未知错误"}`); throw error; }
   }
 
+  async function callVideoApi(payload: Record<string, unknown>) {
+    const response = await fetch("/api/video", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const result = await response.json() as RemoteResult;
+    if (!response.ok || result.error) throw new Error(result.error || `接口请求失败（HTTP ${response.status}）`);
+    return result;
+  }
+
+  async function renderCloudVideo() {
+    if (provider === "local" || !sourceFile) return;
+    const apiKey = apiKeys[provider].trim();
+    if (!apiKey) throw new Error(`请填写${providerInfo.name} API Key。`);
+    if (provider === "custom" && (!customEndpoint.trim() || !customStatusEndpoint.trim())) throw new Error("请填写创建任务和查询任务的 HTTPS 地址。");
+    setStatus("rendering"); setProgress(5); setMessage(`正在提交到${providerInfo.name}…`);
+    if (videoUrl?.startsWith("blob:")) URL.revokeObjectURL(videoUrl); setVideoUrl(""); setVideoBlob(null);
+    const image = await fileToDataUrl(sourceFile);
+    const common = { provider, apiKey, model: models[provider], prompt, duration, endpoint: customEndpoint, statusEndpoint: customStatusEndpoint };
+    let result = await callVideoApi({ action: "create", ...common, image });
+    if (result.videoUrl) { setVideoUrl(result.videoUrl); setStatus("done"); setProgress(100); setMessage(`${providerInfo.name}生成完成`); return; }
+    if (!result.taskId) throw new Error("供应商没有返回任务 ID，请检查接口配置。");
+    setMessage(`${providerInfo.name}正在生成，任务已进入队列…`);
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 4000));
+      result = await callVideoApi({ action: "status", ...common, taskId: result.taskId });
+      setProgress(Math.min(94, 10 + attempt));
+      if (result.status === "failed") throw new Error(result.error || "供应商生成任务失败。");
+      if (result.videoUrl) { setVideoUrl(result.videoUrl); setStatus("done"); setProgress(100); setMessage(`${providerInfo.name}生成完成`); return; }
+    }
+    throw new Error("等待生成超时，请稍后使用同一供应商重试。");
+  }
+
   async function renderVideo() {
     if (!sourceFile) { setMessage("请先上传一张角色图片"); return; }
+    if (provider !== "local") { try { await renderCloudVideo(); } catch (error) { setStatus("error"); setProgress(0); setMessage(error instanceof Error ? error.message : "生成失败，请重试"); } return; }
     let characterUrl = cutoutUrl;
     try {
       if (!characterUrl) characterUrl = await removeImageBackground();
@@ -137,14 +196,15 @@ export default function Home() {
       const result = await completed; const nextUrl = URL.createObjectURL(result); setVideoBlob(result); setVideoUrl(nextUrl); setStatus("done"); setProgress(100); setMessage("短片生成完成，已可预览和下载");
     } catch (error) { setStatus("error"); setProgress(0); setMessage(error instanceof Error ? error.message : "生成失败，请重试"); }
   }
-  function downloadVideo() { if (!videoUrl || !videoBlob) return; const anchor = document.createElement("a"); anchor.href = videoUrl; anchor.download = `jingxu-shot-${Date.now()}.webm`; anchor.click(); }
+  function downloadVideo() { if (!videoUrl) return; if (!videoBlob) { window.open(videoUrl, "_blank", "noopener,noreferrer"); return; } const anchor = document.createElement("a"); anchor.href = videoUrl; anchor.download = `jingxu-shot-${Date.now()}.webm`; anchor.click(); }
 
-  const busy = status === "cutting" || status === "rendering"; const step = !sourceFile ? 1 : !cutoutUrl ? 2 : !videoUrl ? 3 : 4;
+  const busy = status === "cutting" || status === "rendering"; const step = !sourceFile ? 1 : !videoUrl ? ((provider === "local" && !cutoutUrl) || (isRemote && !apiKeys[provider].trim()) ? 2 : 3) : 4;
+  const canGenerate = !!sourceFile && !busy && (provider === "local" || !!apiKeys[provider].trim()) && (provider !== "custom" || (!!customEndpoint.trim() && !!customStatusEndpoint.trim()));
   return <main className="min-h-screen bg-background text-foreground">
     <header className="sticky top-0 z-40 border-b border-border/80 bg-background/92 backdrop-blur-xl"><div className="mx-auto flex h-16 max-w-[1540px] items-center justify-between px-4 sm:px-7">
       <div className="flex items-center gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-primary text-primary-foreground shadow-sm"><WandSparkles className="h-[18px] w-[18px]" /></div><div><div className="flex items-center gap-2"><span className="text-[1.05rem] font-semibold tracking-[-0.03em]">镜序</span><Badge variant="secondary" className="rounded-md px-1.5 py-0 text-[11px] font-medium">可用 MVP</Badge></div><p className="text-xs text-muted-foreground">单镜动态短片工作台</p></div></div>
-      <div className="hidden items-center gap-2 text-sm text-muted-foreground md:flex">{["上传", "抠图", "合成", "下载"].map((label, index) => <div key={label} className="flex items-center gap-2"><span className={`flow-step ${step === index + 1 ? "is-active" : step > index + 1 ? "is-done" : ""}`}><b>{step > index + 1 ? <Check className="h-3 w-3" /> : index + 1}</b>{label}</span>{index < 3 && <span className="h-px w-6 bg-border" />}</div>)}</div>
-      <div className="flex items-center gap-2 text-xs text-muted-foreground"><ShieldCheck className="h-4 w-4 text-emerald-600" /><span className="hidden sm:inline">本地处理 · 不消耗 API</span></div>
+      <div className="hidden items-center gap-2 text-sm text-muted-foreground md:flex">{["上传", "配置", "生成", "下载"].map((label, index) => <div key={label} className="flex items-center gap-2"><span className={`flow-step ${step === index + 1 ? "is-active" : step > index + 1 ? "is-done" : ""}`}><b>{step > index + 1 ? <Check className="h-3 w-3" /> : index + 1}</b>{label}</span>{index < 3 && <span className="h-px w-6 bg-border" />}</div>)}</div>
+      <div className="flex items-center gap-2 text-xs text-muted-foreground"><ShieldCheck className="h-4 w-4 text-emerald-600" /><span className="hidden sm:inline">{isRemote ? `${providerInfo.name} · 用户自带额度` : "本地处理 · 不消耗 API"}</span></div>
     </div></header>
     <section className="mx-auto grid max-w-[1540px] gap-5 px-4 py-5 lg:grid-cols-[380px_minmax(360px,1fr)_360px] sm:px-6 sm:py-6">
       <aside className="space-y-4">
@@ -152,19 +212,30 @@ export default function Home() {
           <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(event) => chooseCharacter(event.target.files?.[0])} />
           {!sourceUrl ? <button className="upload-zone" onClick={() => fileInput.current?.click()}><span className="grid h-12 w-12 place-items-center rounded-2xl bg-secondary"><ImagePlus className="h-5 w-5" /></span><span className="font-semibold">上传角色图片</span><span className="text-xs text-muted-foreground">PNG / JPG / WebP，建议人物清晰</span></button> : <div className="grid grid-cols-2 gap-3"><button className="asset-preview" onClick={() => fileInput.current?.click()}><img src={sourceUrl} alt="原图" /><span>原图 · 点击更换</span></button><div className="asset-preview checkerboard">{cutoutUrl ? <img src={cutoutUrl} alt="抠图结果" /> : <div className="grid h-full place-items-center px-3 text-center text-xs leading-5 text-muted-foreground">点击下方按钮<br />在浏览器内抠图</div>}<span>{cutoutUrl ? "透明背景" : "等待抠图"}</span></div></div>}
           <Button className="mt-4 h-11 w-full rounded-xl" variant={cutoutUrl ? "secondary" : "default"} disabled={!sourceFile || busy} onClick={() => void removeImageBackground()}>{status === "cutting" ? <LoaderCircle className="h-4 w-4 animate-spin" /> : cutoutUrl ? <RefreshCw className="h-4 w-4" /> : <Scissors className="h-4 w-4" />}{status === "cutting" ? "正在智能抠图" : cutoutUrl ? "重新抠图" : "智能抠图"}</Button>
-          <p className="mt-3 text-xs leading-5 text-muted-foreground">首次抠图会下载约 40MB 的本地模型，之后由浏览器缓存。素材不会上传到服务器。</p>
+          <p className="mt-3 text-xs leading-5 text-muted-foreground">首次抠图会下载约 40MB 的本地模型，之后由浏览器缓存。抠图阶段不会上传素材。</p>
         </div>
         <div className="workspace-card p-5"><p className="eyebrow">02 · 镜头描述</p><label className="field-label mt-3" htmlFor="prompt">动作与运镜</label><Textarea id="prompt" value={prompt} onChange={(event) => { setPrompt(event.target.value); resetResult(); }} className="mt-2 min-h-24 resize-none rounded-xl bg-secondary/55 leading-6" /><label className="field-label mt-4" htmlFor="subtitle">画面字幕</label><input id="subtitle" value={subtitle} onChange={(event) => { setSubtitle(event.target.value); resetResult(); }} className="field-input mt-2" placeholder="输入对白或旁白" /></div>
       </aside>
-      <section className="workspace-card overflow-hidden p-4 sm:p-5"><div className="mb-4 flex items-start justify-between gap-3"><div><p className="eyebrow">实时预览</p><h2 className="mt-1 text-xl font-semibold">9:16 竖屏镜头</h2></div><Badge variant="secondary">720 × 1280</Badge></div><div className="stage-shell"><canvas ref={canvasRef} width={720} height={1280} aria-label="动态短片画面预览" />{!sourceUrl && <button className="stage-empty" onClick={() => fileInput.current?.click()}><Upload className="h-6 w-6" /><b>先上传角色图片</b><span>你会在这里看到最终构图</span></button>}{busy && <div className="stage-working"><LoaderCircle className="h-8 w-8 animate-spin" /><b>{status === "cutting" ? "正在识别人物边缘" : "正在逐帧编码视频"}</b><span>{progress}%</span></div>}</div><div className="mt-4 flex items-center gap-3"><Play className="h-4 w-4 text-muted-foreground" /><input aria-label="预览画面进度" type="range" min="0" max="100" value={Math.round(previewTime * 100)} onChange={(event) => setPreviewTime(Number(event.target.value) / 100)} className="timeline" /><span className="w-12 text-right text-xs tabular-nums text-muted-foreground">{(previewTime * duration).toFixed(1)}s</span></div></section>
+      <section className="workspace-card overflow-hidden p-4 sm:p-5"><div className="mb-4 flex items-start justify-between gap-3"><div><p className="eyebrow">实时预览</p><h2 className="mt-1 text-xl font-semibold">9:16 竖屏镜头</h2></div><Badge variant="secondary">720 × 1280</Badge></div><div className="stage-shell">{videoUrl && <video src={videoUrl} controls autoPlay loop playsInline className="stage-video" />}<canvas ref={canvasRef} width={720} height={1280} aria-label="动态短片画面预览" className={videoUrl ? "hidden" : ""} />{!sourceUrl && <button className="stage-empty" onClick={() => fileInput.current?.click()}><Upload className="h-6 w-6" /><b>先上传角色图片</b><span>你会在这里看到最终构图</span></button>}{busy && <div className="stage-working"><LoaderCircle className="h-8 w-8 animate-spin" /><b>{status === "cutting" ? "正在识别人物边缘" : isRemote ? `等待${providerInfo.name}生成` : "正在逐帧编码视频"}</b><span>{progress}%</span></div>}</div>{!videoUrl && <div className="mt-4 flex items-center gap-3"><Play className="h-4 w-4 text-muted-foreground" /><input aria-label="预览画面进度" type="range" min="0" max="100" value={Math.round(previewTime * 100)} onChange={(event) => setPreviewTime(Number(event.target.value) / 100)} className="timeline" /><span className="w-12 text-right text-xs tabular-nums text-muted-foreground">{(previewTime * duration).toFixed(1)}s</span></div>}</section>
       <aside className="space-y-4">
-        <div className="workspace-card p-5"><div className="mb-4"><p className="eyebrow">03 · 画面设置</p><h2 className="mt-1 text-lg font-semibold">选择场景和运镜</h2></div><div className="grid grid-cols-2 gap-2">{SCENES.map((item) => <button key={item.key} className={`scene-option ${sceneKey === item.key && !backgroundUrl ? "is-selected" : ""}`} onClick={() => { setSceneKey(item.key); if (backgroundUrl) URL.revokeObjectURL(backgroundUrl); setBackgroundUrl(""); resetResult(); }}><span className="scene-swatch" style={{ background: `linear-gradient(145deg, ${item.colors[0]}, ${item.colors[1]} 58%, ${item.colors[2]})` }} /><b>{item.name}</b><small>{item.note}</small></button>)}</div><input ref={backgroundInput} type="file" accept="image/*" className="hidden" onChange={(event) => chooseBackground(event.target.files?.[0])} /><Button variant="outline" className="mt-3 h-10 w-full rounded-xl" onClick={() => backgroundInput.current?.click()}><ImagePlus className="h-4 w-4" />{backgroundUrl ? "更换自定义背景" : "上传自己的背景"}</Button>{backgroundUrl && <button className="mt-2 w-full text-xs text-muted-foreground underline-offset-4 hover:underline" onClick={() => { URL.revokeObjectURL(backgroundUrl); setBackgroundUrl(""); resetResult(); }}>移除自定义背景</button>}
-          <div className="mt-5 border-t pt-5"><span className="field-label">镜头运动</span><div className="mt-2 grid grid-cols-3 gap-2">{([['push','推进'],['float','呼吸'],['slide','横移']] as [Motion, string][]).map(([value, label]) => <button key={value} className={`segmented ${motion === value ? "is-selected" : ""}`} onClick={() => { setMotion(value); resetResult(); }}>{label}</button>)}</div></div><div className="mt-4"><span className="field-label">视频时长</span><div className="mt-2 grid grid-cols-3 gap-2">{[4, 6, 8].map((value) => <button key={value} className={`segmented ${duration === value ? "is-selected" : ""}`} onClick={() => { setDuration(value); resetResult(); }}>{value} 秒</button>)}</div></div>
+        <div className="workspace-card p-5">
+          <div className="mb-4"><p className="eyebrow">03 · 生成引擎</p><h2 className="mt-1 text-lg font-semibold">选择视频模型</h2></div>
+          <div className="grid grid-cols-2 gap-2">{PROVIDERS.map((item) => <button key={item.id} className={`provider-option ${provider === item.id ? "is-selected" : ""}`} onClick={() => selectProvider(item.id)}><b>{item.name}</b><small>{item.note}</small></button>)}</div>
+          {isRemote && <div className="mt-4 space-y-3 border-t pt-4">
+            <div><label className="field-label" htmlFor="api-key">API Key</label><div className="credential-wrap mt-2"><KeyRound className="h-4 w-4" /><input id="api-key" type={showApiKey ? "text" : "password"} value={apiKeys[provider]} onChange={(event) => { setApiKeys((current) => ({ ...current, [provider]: event.target.value })); resetResult(); }} placeholder={`填写${providerInfo.name}密钥`} /><button aria-label={showApiKey ? "隐藏密钥" : "显示密钥"} onClick={() => setShowApiKey((current) => !current)}>{showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div></div>
+            <div><label className="field-label" htmlFor="model-name">模型名称</label><input id="model-name" value={models[provider]} onChange={(event) => { setModels((current) => ({ ...current, [provider]: event.target.value })); resetResult(); }} className="field-input mt-2" placeholder="供应商模型 ID" /></div>
+            {provider === "custom" && <><div><label className="field-label" htmlFor="create-endpoint">创建任务地址</label><input id="create-endpoint" value={customEndpoint} onChange={(event) => { setCustomEndpoint(event.target.value); resetResult(); }} className="field-input mt-2" placeholder="https://api.example.com/videos" /></div><div><label className="field-label" htmlFor="status-endpoint">查询任务地址</label><input id="status-endpoint" value={customStatusEndpoint} onChange={(event) => { setCustomStatusEndpoint(event.target.value); resetResult(); }} className="field-input mt-2" placeholder="https://api.example.com/videos/{task_id}" /></div></>}
+            <div className="flex items-start gap-2 rounded-xl bg-emerald-50 px-3 py-2.5 text-xs leading-5 text-emerald-900"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" /><span>密钥仅随当前请求转发，不写入数据库或浏览器存储；费用计入你的 API 账户。</span></div>
+            {provider !== "custom" && <a className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-950" href={provider === "jimeng" ? "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey" : "https://kling.ai/dev/api-key"} target="_blank" rel="noreferrer">前往供应商获取 API Key <ExternalLink className="h-3 w-3" /></a>}
+          </div>}
+          <div className="mt-4 border-t pt-4"><span className="field-label">视频时长</span><div className="mt-2 grid grid-cols-3 gap-2">{[4, 6, 8].map((value) => <button key={value} className={`segmented ${duration === value ? "is-selected" : ""}`} onClick={() => { setDuration(value); resetResult(); }}>{value} 秒</button>)}</div></div>
         </div>
-        <div className="workspace-card p-5"><div className="flex items-center gap-3"><div className={`status-dot ${status}`} /><div><p className="text-sm font-semibold">{message}</p><p className="mt-0.5 text-xs text-muted-foreground">{status === "done" ? `${(videoBlob?.size ?? 0) / 1024 / 1024 < 1 ? "小于 1" : ((videoBlob?.size ?? 0) / 1024 / 1024).toFixed(1)} MB · WebM` : "单镜生成，不排队"}</p></div></div>{busy && <Progress value={progress} className="mt-4 h-2" />}<Button size="lg" className="mt-5 h-12 w-full rounded-xl" disabled={!sourceFile || busy} onClick={() => void renderVideo()}><Sparkles className="h-4 w-4" />{videoUrl ? "重新生成短片" : "生成动态短片"}</Button>{videoUrl && <div className="mt-3 grid gap-2"><video src={videoUrl} controls playsInline className="aspect-video w-full rounded-xl bg-black object-cover" /><Button variant="outline" className="h-11 w-full rounded-xl" onClick={downloadVideo}><Download className="h-4 w-4" />下载 WebM 视频</Button></div>}</div>
-        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900"><b className="block">能力边界</b>当前是“智能抠图 + 真实视频合成”，会输出可下载的视频；不会凭文字生成新动作。这样可以零 API 成本验证用户是否愿意完成并导出一个镜头。</div>
+        {!isRemote && <div className="workspace-card p-5"><div className="mb-4"><p className="eyebrow">04 · 画面设置</p><h2 className="mt-1 text-lg font-semibold">选择场景和运镜</h2></div><div className="grid grid-cols-2 gap-2">{SCENES.map((item) => <button key={item.key} className={`scene-option ${sceneKey === item.key && !backgroundUrl ? "is-selected" : ""}`} onClick={() => { setSceneKey(item.key); if (backgroundUrl) URL.revokeObjectURL(backgroundUrl); setBackgroundUrl(""); resetResult(); }}><span className="scene-swatch" style={{ background: `linear-gradient(145deg, ${item.colors[0]}, ${item.colors[1]} 58%, ${item.colors[2]})` }} /><b>{item.name}</b><small>{item.note}</small></button>)}</div><input ref={backgroundInput} type="file" accept="image/*" className="hidden" onChange={(event) => chooseBackground(event.target.files?.[0])} /><Button variant="outline" className="mt-3 h-10 w-full rounded-xl" onClick={() => backgroundInput.current?.click()}><ImagePlus className="h-4 w-4" />{backgroundUrl ? "更换自定义背景" : "上传自己的背景"}</Button>{backgroundUrl && <button className="mt-2 w-full text-xs text-muted-foreground underline-offset-4 hover:underline" onClick={() => { URL.revokeObjectURL(backgroundUrl); setBackgroundUrl(""); resetResult(); }}>移除自定义背景</button>}<div className="mt-5 border-t pt-5"><span className="field-label">镜头运动</span><div className="mt-2 grid grid-cols-3 gap-2">{([["push","推进"],["float","呼吸"],["slide","横移"]] as [Motion, string][]).map(([value, label]) => <button key={value} className={`segmented ${motion === value ? "is-selected" : ""}`} onClick={() => { setMotion(value); resetResult(); }}>{label}</button>)}</div></div></div>}
+        <div className="workspace-card p-5"><div className="flex items-center gap-3"><div className={`status-dot ${status}`} /><div><p className="text-sm font-semibold">{message}</p><p className="mt-0.5 text-xs text-muted-foreground">{status === "done" ? (isRemote ? `${providerInfo.name} · 模型生成结果` : `${(videoBlob?.size ?? 0) / 1024 / 1024 < 1 ? "小于 1" : ((videoBlob?.size ?? 0) / 1024 / 1024).toFixed(1)} MB · WebM`) : (isRemote ? "调用费用计入你的 API 账户" : "单镜生成，不排队")}</p></div></div>{busy && <Progress value={progress} className="mt-4 h-2" />}<Button size="lg" className="mt-5 h-12 w-full rounded-xl" disabled={!canGenerate} onClick={() => void renderVideo()}><Sparkles className="h-4 w-4" />{videoUrl ? `重新调用${providerInfo.name}` : isRemote ? `调用${providerInfo.name}生成` : "生成本地动态短片"}</Button>{videoUrl && <Button variant="outline" className="mt-3 h-11 w-full rounded-xl" onClick={downloadVideo}>{isRemote ? <ExternalLink className="h-4 w-4" /> : <Download className="h-4 w-4" />}{isRemote ? "打开生成视频" : "下载 WebM 视频"}</Button>}</div>
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900"><b className="block">能力边界</b>{isRemote ? "云端模式会把原始角色图和提示词发送给所选供应商，并由该供应商生成视频。请确认你有权上传素材。" : "本地模式是“智能抠图 + 真实视频合成”，不凭文字生成新动作，也不产生 API 费用。"}</div>
       </aside>
     </section>
-    <footer className="mx-auto flex max-w-[1540px] flex-wrap items-center justify-between gap-2 px-6 pb-6 text-xs text-muted-foreground"><span>镜序 MVP · 所有图片与视频均在当前浏览器处理</span><span className="flex items-center gap-1.5"><Film className="h-3.5 w-3.5" />建议使用最新版 Chrome / Edge</span></footer>
+    <footer className="mx-auto flex max-w-[1540px] flex-wrap items-center justify-between gap-2 px-6 pb-6 text-xs text-muted-foreground"><span>镜序 MVP · 本地模式不上传素材；云端模式只发送给用户选择的供应商</span><span className="flex items-center gap-1.5"><Film className="h-3.5 w-3.5" />建议使用最新版 Chrome / Edge</span></footer>
   </main>;
 }
+
